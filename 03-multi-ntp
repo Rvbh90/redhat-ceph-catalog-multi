@@ -1,0 +1,90 @@
+#!/bin/bash 
+
+# Python Block
+python3 - <<EOF
+import subprocess
+import json
+import sys
+import tempfile
+import re
+from pathlib import Path
+
+# Find all input_*.json files in /tmp
+files = sorted(Path("/tmp").glob("ceph-input_*.json"))
+
+if not files:
+    print("❌ No ceph-input_*.json files found in /tmp")
+    sys.exit(1)
+
+# Pick the latest one
+latest_file = files[-1]
+print(f"📄 Using input file: {latest_file}")
+
+# Load JSON from latest file
+with latest_file.open() as f:
+    data = json.load(f)
+
+# 🔄 Parse NODES_INPUT (format: [[value:IP, key:FQDN]])
+nodes_raw = data.get("NODES_INPUT", "")
+matches = re.findall(r"value:([\d\.]+)", nodes_raw)
+if not matches:
+    print("❌ Could not extract IP addresses from NODES_INPUT")
+    sys.exit(1)
+
+HOSTS = matches
+USERNAME = data.get("host_username", "root")
+PASSWORD = data.get("host_password", "")
+
+CORPORATE_NTP = data["corporate_ntp"]
+SOLUTION_NET_IP = data["solution_network_ip"]
+
+# 🔧 chrony config template
+chrony_config = f"""pool {CORPORATE_NTP} iburst
+server {SOLUTION_NET_IP}
+
+driftfile /var/lib/chrony/drift
+makestep 1.0 3
+rtcsync
+keyfile /etc/chrony.keys
+logdir /var/log/chrony
+"""
+
+def run_cmd(cmd, check=True):
+    print(f"💻 Running: {cmd}")
+    try:
+        result = subprocess.run(cmd, shell=True, check=check, capture_output=True, text=True)
+        if result.stdout.strip():
+            print(result.stdout.strip())
+        if result.stderr.strip():
+            print(result.stderr.strip())
+        return result
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Command failed: {e.stderr.strip()}")
+        sys.exit(1)
+
+# Use sshpass to pass the password into ssh/scp
+def install_chrony(ip):
+    run_cmd(f'sshpass -p "{PASSWORD}" ssh -o StrictHostKeyChecking=no {USERNAME}@{ip} "yum install -y chrony"')
+
+def push_config(ip, config_path):
+    run_cmd(f'sshpass -p "{PASSWORD}" scp -o StrictHostKeyChecking=no "{config_path}" {USERNAME}@{ip}:/etc/chrony.conf')
+
+def restart_chrony(ip):
+    run_cmd(f'sshpass -p "{PASSWORD}" ssh -o StrictHostKeyChecking=no {USERNAME}@{ip} "systemctl restart chronyd && systemctl enable chronyd"')
+
+def main():
+    # Save the config to a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, mode="w") as tmp:
+        tmp.write(chrony_config)
+        tmp_path = tmp.name
+
+    for ip in HOSTS:
+        print(f"\n🛠️ Working on {ip}...")
+        install_chrony(ip)
+        push_config(ip, tmp_path)
+        restart_chrony(ip)
+        print(f"✅ chronyd configured on {ip}")
+
+if __name__ == "__main__":
+    main()
+EOF
