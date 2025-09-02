@@ -1,0 +1,143 @@
+#!/bin/bash
+
+python3 - <<EOF
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+# === Constants ===
+SSH_KEY_PATH = Path.home() / ".ssh" / "id_rsa"
+
+# Find all input_*.json files in /tmp
+files = sorted(Path("/tmp").glob("ceph-input_*.json"))
+
+if not files:
+    raise FileNotFoundError("No ceph-input_*.json files found in /tmp")
+
+# Pick the latest one
+latest_file = files[-1]
+
+print(f"Using input file: {latest_file}")
+
+# === Parse JSON Input from Morpheus ===
+def load_input():
+    # Simulate the input passed from Bash using a heredoc or external file
+    with latest_file.open() as f:
+        data = json.load(f)
+    return data
+
+# === Extract IPs and Hostnames from nodes string ===
+def parse_nodes(input_str):
+    ips = re.findall(r'value:([\d.]+)', input_str)
+    hosts = re.findall(r'key:([\w\.-]+)', input_str)
+
+    if len(ips) != len(hosts):
+        raise ValueError("❌ IP and Hostname count mismatch.")
+
+    if len(set(ips)) != len(ips):
+        raise ValueError("❌ Duplicate IPs found.")
+    if len(set(hosts)) != len(hosts):
+        raise ValueError("❌ Duplicate Hostnames found.")
+
+    return dict(zip(hosts, ips))
+
+# === Ping Test ===
+def ping_test(ip, host):
+    print(f"📡 Pinging {ip} ({host})...")
+    result = subprocess.run(["ping", "-c", "2", "-W", "2", ip], stdout=subprocess.DEVNULL)
+    if result.returncode != 0:
+        raise RuntimeError(f"❌ {ip} ({host}) is unreachable.")
+    print("✅ Reachable")
+
+# === Ensure sshpass is available ===
+def ensure_sshpass():
+    if subprocess.call("which sshpass", shell=True, stdout=subprocess.DEVNULL) != 0:
+        raise EnvironmentError("❌ sshpass not found. Please install it manually.")
+
+# === Generate SSH Key if not present ===
+def generate_ssh_key():
+    if not SSH_KEY_PATH.exists():
+        print("🔐 Generating SSH key...")
+        subprocess.run(['ssh-keygen', '-t', 'rsa', '-b', '4096', '-N', '', '-f', str(SSH_KEY_PATH)], check=True)
+    else:
+        print("✅ SSH key already exists.")
+
+# === Copy SSH Key ===
+def copy_ssh_key(username, password, ip):
+    print(f"📤 Injecting SSH key into {ip}...")
+    subprocess.run(
+        ['sshpass', '-p', password,
+         'ssh-copy-id', '-o', 'StrictHostKeyChecking=no',
+         '-i', f"{SSH_KEY_PATH}.pub", f"{username}@{ip}"],
+        check=True
+    )
+
+# === Register Red Hat Subscription ===
+def register_rhn(username, password, rhn_user, rhn_pass, ip):
+    check_cmd = f'subscription-manager status'
+    ssh_cmd = f'ssh -i {SSH_KEY_PATH} {username}@{ip} "{check_cmd}"'
+    result = subprocess.run(ssh_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    if "Overall Status: Current" in result.stdout:
+        print(f"✅ {ip} is already registered.")
+    else:
+        print(f"🛠 Registering {ip} to Red Hat...")
+        reg_cmd = (
+            f'subscription-manager register '
+            f'--username="{rhn_user}" --password="{rhn_pass}" '
+            f'--auto-attach --force'
+        )
+        full_cmd = f'ssh -i {SSH_KEY_PATH} {username}@{ip} "{reg_cmd}"'
+        subprocess.run(full_cmd, shell=True, check=True)
+
+# === Enable Repos ===
+def enable_repos(username, ip):
+    print(f"📦 Enabling repos on {ip}...")
+    repo_cmd = (
+        f'subscription-manager repos '
+        f'--enable=rhel-9-for-x86_64-baseos-rpms '
+        f'--enable=rhel-9-for-x86_64-appstream-rpms '
+        f'--enable=rhceph-8-tools-for-rhel-9-x86_64-rpms'
+    )
+    ssh_cmd = f'ssh -i {SSH_KEY_PATH} {username}@{ip} "{repo_cmd}"'
+    subprocess.run(ssh_cmd, shell=True, check=True)
+
+# === Process Each Host ===
+def process_host(hostname, ip, username, password, rhn_user, rhn_pass):
+    ping_test(ip, hostname)
+    copy_ssh_key(username, password, ip)
+    register_rhn(username, password, rhn_user, rhn_pass, ip)
+    enable_repos(username, ip)
+
+# === MAIN ===
+def main():
+    data = load_input()
+
+    username = data["host_username"]
+    password = data["host_password"]
+    rhn_user = data["rhn_username"]
+    rhn_pass = data["rhn_password"]
+
+    nodes_input = data["NODES_INPUT"]
+
+    try:
+        host_ip_map = parse_nodes(nodes_input)
+        ensure_sshpass()
+        generate_ssh_key()
+
+        for host, ip in host_ip_map.items():
+            print(f"\n🔧 Processing {host} ({ip})")
+            process_host(host, ip, username, password, rhn_user, rhn_pass)
+
+        print("\n✅ All hosts processed successfully.")
+
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        sys.exit(1)
+
+# === Execute main ===
+if __name__ == "__main__":
+    main()
+    
