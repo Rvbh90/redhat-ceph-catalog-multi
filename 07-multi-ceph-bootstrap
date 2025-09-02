@@ -1,0 +1,71 @@
+#!/bin/bash
+
+# Python block
+python3 - <<EOF
+import subprocess
+import json
+import sys
+import re
+from pathlib import Path
+
+# Find all ceph-input_*.json files in /tmp
+files = sorted(Path("/tmp").glob("ceph-input_*.json"))
+
+if not files:
+    raise FileNotFoundError("No ceph-input_*.json files found in /tmp")
+
+# Pick the latest file
+latest_file = files[-1]
+print(f"📄 Using input file: {latest_file}")
+
+# Load JSON from file
+with latest_file.open() as f:
+    data = json.load(f)
+
+# Parse NODES_INPUT string using regex
+raw_nodes = data["NODES_INPUT"]
+pattern = r"value:([\d\.]+),\s*key:([\w\.\-]+)"
+matches = re.findall(pattern, raw_nodes)
+
+if not matches:
+    print("❌ Failed to parse NODES_INPUT format.")
+    sys.exit(1)
+
+# Now you have list of (IP, FQDN) tuples
+nodes = [(ip.strip(), fqdn.strip()) for ip, fqdn in matches]
+HOST1 = nodes[0][0]  # First node's IP
+
+# Other config values
+CEPH_USER = data["ceph_adminuser"]
+DASH_USER = data["dashboard_user"]
+DASH_PASS = data["dashboard_password"]
+SSH_KEY_PATH = Path.home() / ".ssh" / "id_rsa"
+
+def run(command, check=True):
+    print(f"🚀 Running: {command}")
+    try:
+        result = subprocess.run(command, shell=True, check=check, text=True, capture_output=True)
+        if result.stdout.strip():
+            print(result.stdout.strip())
+        if result.stderr.strip():
+            print(result.stderr.strip())
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Error: {e.stderr.strip()}")
+        sys.exit(1)
+
+def bootstrap_cephadm(host, ssh_key_path, ceph_user, dashboard_user, dashboard_password):
+    cmd = (
+        f'ssh -i "{ssh_key_path}" root@{host} '
+        f'"cephadm bootstrap --ssh-user {ceph_user} --mon-ip {host} '
+        f'--allow-fqdn-hostname --registry-json /etc/mylogin.json '
+        f'--initial-dashboard-user {dashboard_user} '
+        f'--initial-dashboard-password {dashboard_password}"'
+    )
+    run(cmd)
+
+def main():
+    bootstrap_cephadm(HOST1, SSH_KEY_PATH, CEPH_USER, DASH_USER, DASH_PASS)
+
+if __name__ == "__main__":
+    main()
+EOF
