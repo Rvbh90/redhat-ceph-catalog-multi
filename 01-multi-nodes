@@ -1,0 +1,92 @@
+#!/bin/bash
+
+# ===== Read input from Morpheus =====
+read -r -d '' JSON_INPUT <<EOF
+{
+    "NODES_INPUT": "<%=customOptions.nodes%>",
+    "host_username": "<%=customOptions.host_username%>",
+    "host_password": "<%=customOptions.host_usr_password%>",
+    "rhn_username": "<%=customOptions.rhsub_username%>",
+    "rhn_password": "<%=customOptions.rhsub_password%>",
+    "corporate_ntp": "<%=customOptions.corporate_ntp%>",
+    "solution_network_ip": "<%=customOptions.solution_network_ip%>",
+    "ceph_adminuser": "<%=customOptions.ceph_adminuser%>",
+    "ceph_adminuser_password": "<%=customOptions.ceph_adminuser_password%>",
+    "rhsub_username": "<%=customOptions.rhsub_username%>",
+    "rhsub_password": "<%=customOptions.rhsub_password%>",
+    "url_registry": "<%=customOptions.url_registry%>",
+    "dashboard_user": "<%=customOptions.dashboard_user%>",
+    "dashboard_password": "<%=customOptions.dashboard_password%>",
+    "rbd_pool_name": "<%=customOptions.rbd_pool_name%>",
+    "rgw_pool_name": "<%=customOptions.rgw_pool_name%>",
+    "fs_pool_name": "<%=customOptions.fs_pool_name%>",
+    "number_of_daemons": "<%=customOptions.number_of_daemons%>"
+}
+EOF
+
+# ====== Generate timestamped input file ======
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+INPUT_FILE="/tmp/ceph-input_${TIMESTAMP}.json"
+echo "$JSON_INPUT" > "$INPUT_FILE"
+
+# ===== Extract NODES_INPUT from JSON =====
+NODES_INPUT=$(echo "$JSON_INPUT" | jq -r '.NODES_INPUT')
+
+# ===== Validate and extract IP-host map using Python =====
+HOST_IP_JSON=$(python3 - <<EOF
+import re, json, sys
+
+input_str = """$NODES_INPUT"""
+
+ips = re.findall(r'value:([\d.]+)', input_str)
+hosts = re.findall(r'key:([\w.-]+)', input_str)
+
+if len(ips) != len(hosts):
+    print("❌ Error: Number of IPs and hostnames do not match.")
+    sys.exit(1)
+
+if len(set(ips)) != len(ips):
+    print("❌ Error: Duplicate IPs found.")
+    sys.exit(1)
+
+if len(set(hosts)) != len(hosts):
+    print("❌ Error: Duplicate hostnames found.")
+    sys.exit(1)
+
+host_ip_map = dict(zip(hosts, ips))
+print(json.dumps(host_ip_map))
+EOF
+)
+
+# ===== Exit if validation failed =====
+if [[ -z "$HOST_IP_JSON" ]]; then
+    echo "❌ Validation failed. Exiting."
+    exit 1
+fi
+
+echo "✅ IPs and hostnames are unique. Proceeding to ping test..."
+
+# ===== Perform ping test =====
+echo "📡 Running ping test for each IP..."
+FAILED_PINGS=()
+
+while read -r HOST IP; do
+    echo -n "🔹 Pinging $IP ($HOST)... "
+    if ping -c 2 -W 2 "$IP" > /dev/null 2>&1; then
+        echo "✅ Reachable"
+    else
+        echo "❌ Unreachable"
+        FAILED_PINGS+=("$IP")
+    fi
+done < <(echo "$HOST_IP_JSON" | jq -r 'to_entries[] | "\(.key) \(.value)"')
+
+# ===== Report unreachable IPs =====
+if [[ ${#FAILED_PINGS[@]} -gt 0 ]]; then
+    echo -e "\n❌ Error: The following IPs are unreachable:"
+    for ip in "${FAILED_PINGS[@]}"; do
+        echo "  - $ip"
+    done
+    exit 1
+else
+    echo -e "\n✅ All IPs are reachable!"
+fi
