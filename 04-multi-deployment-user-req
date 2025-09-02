@@ -1,0 +1,120 @@
+#!/bin/bash
+
+# Python block
+python3 - <<EOF
+import subprocess
+import json
+import sys
+import crypt
+import re
+from pathlib import Path
+
+# Find all input_*.json files in /tmp
+files = sorted(Path("/tmp").glob("ceph-input_*.json"))
+
+if not files:
+    raise FileNotFoundError("❌ No ceph-input_*.json files found in /tmp")
+
+latest_file = files[-1]
+print(f"📄 Using input file: {latest_file}")
+
+# Load JSON
+with latest_file.open() as f:
+    data = json.load(f)
+
+# Extract host IPs and FQDNs from NODES_INPUT string
+nodes_input = data.get("NODES_INPUT", "")
+nodes = re.findall(r"value:([\d\.]+), key:([^\]]+)", nodes_input)
+if not nodes:
+    print("❌ No nodes found in NODES_INPUT.")
+    sys.exit(1)
+
+HOSTS = [ip for ip, _ in nodes]
+FQDNS = [fqdn for _, fqdn in nodes]
+
+SSH_KEY_PATH = Path.home() / ".ssh" / "id_rsa"
+USER = data["ceph_adminuser"]
+PASS = data["ceph_adminuser_password"]
+ENCRYPTED_PASS = crypt.crypt(PASS, crypt.mksalt(crypt.METHOD_SHA512))
+
+def run(command, check=True):
+    print(f"💻 Running: {command}")
+    try:
+        result = subprocess.run(command, shell=True, check=check, text=True, capture_output=True)
+        if result.stdout:
+            print(result.stdout.strip())
+        if result.stderr:
+            print(result.stderr.strip())
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Error: {e.stderr.strip()}")
+        sys.exit(1)
+
+def ensure_ssh_key():
+    if not SSH_KEY_PATH.exists():
+        print("🔐 SSH key missing, generating...")
+        run(f'ssh-keygen -t rsa -b 4096 -N "" -f "{SSH_KEY_PATH}"')
+    else:
+        print(f"✅ SSH key already exists: {SSH_KEY_PATH}")
+
+def setup_user(ip):
+    print(f"\n🚀 Setting up user '{USER}' on {ip}...")
+    run(f'ssh-copy-id -o StrictHostKeyChecking=no -i "{SSH_KEY_PATH}.pub" root@{ip}')
+    run(f'ssh -i "{SSH_KEY_PATH}" root@{ip} "adduser {USER} || echo User exists"')
+    run(f'ssh -i "{SSH_KEY_PATH}" root@{ip} "echo \'{USER}:{ENCRYPTED_PASS}\' | chpasswd -e"')
+    sudoer_entry=f"{USER} ALL = (root) NOPASSWD:ALL"
+    run(f'ssh -i "{SSH_KEY_PATH}" root@{ip} "echo \'{sudoer_entry}\' > /etc/sudoers.d/{USER} && chmod 440 /etc/sudoers.d/{USER}"')
+    run(f'ssh -i "{SSH_KEY_PATH}" root@{ip} "mkdir -p /home/{USER}/.ssh && chown {USER}:{USER} /home/{USER}/.ssh && chmod 700 /home/{USER}/.ssh"')
+    print(f"✅ User '{USER}' setup completed on {ip}")
+
+def generate_ssh_key_for_deploy_on_host1(ip):
+    print(f"\n🔑 Generating SSH key for user '{USER}' on host1 {ip} (if missing)...")
+    cmd = (
+        f'ssh -i "{SSH_KEY_PATH}" root@{ip} '
+        f'"mkdir -p /home/{USER}/.ssh && chown {USER}:{USER} /home/{USER}/.ssh && chmod 700 /home/{USER}/.ssh && '
+        f'sudo -u {USER} ssh-keygen -t rsa -b 4096 -f /home/{USER}/.ssh/id_rsa -N \'\'"'
+    )
+    run(cmd)
+    print(f"✅ SSH key for user '{USER}' on host1 {ip} is ensured.")
+
+def copy_deploy_ssh_key_to_others(from_ip, all_hosts):
+    print(f"\n🔗 Copying SSH key from '{USER}@{from_ip}' to other nodes...")
+    for ip in all_hosts:
+        print(f"➡️  Copying to {ip}...")
+        run(f'ssh -i "{SSH_KEY_PATH}" root@{ip} "mkdir -p /home/{USER}/.ssh && chown {USER}:{USER} /home/{USER}/.ssh && chmod 700 /home/{USER}/.ssh"')
+        run(f'scp -i "{SSH_KEY_PATH}" root@{from_ip}:/home/{USER}/.ssh/id_rsa.pub root@{ip}:/home/{USER}/.ssh/authorized_keys')
+        run(f'ssh -i "{SSH_KEY_PATH}" root@{ip} "chown {USER}:{USER} /home/{USER}/.ssh/authorized_keys && chmod 600 /home/{USER}/.ssh/authorized_keys"')
+    print("✅ SSH keys copied successfully.")
+
+def install_dev_tools(ip):
+    print(f"\n🛠️ Installing Development Tools on {ip}...")
+    run(f'ssh -i "{SSH_KEY_PATH}" root@{ip} "yum -y groupinstall \'Development Tools\'"')
+    print(f"✅ Development Tools installed on {ip}")
+
+def create_admin_ssh_config_on_host1(target_ip, fqdn_list):
+    print(f"\n📝 Creating admin SSH config on host1 {target_ip} (FQDN-based)...")
+    ssh_config_content = ""
+    for fqdn in fqdn_list:
+        ssh_config_content += f"Host {fqdn}\n"
+        ssh_config_content += f"   Hostname {fqdn}\n"
+        ssh_config_content += f"   User {USER}\n"
+
+    cmd = (
+        f'ssh -i "{SSH_KEY_PATH}" root@{target_ip} '
+        f'"echo \'{ssh_config_content}\' > /home/{USER}/.ssh/config && '
+        f'chown {USER}:{USER} /home/{USER}/.ssh/config && chmod 600 /home/{USER}/.ssh/config"'
+    )
+    run(cmd)
+    print(f"✅ SSH config created on /home/{USER}/.ssh/config at {target_ip}")
+
+def main():
+    ensure_ssh_key()
+    for ip in HOSTS:
+        setup_user(ip)
+        install_dev_tools(ip)
+    generate_ssh_key_for_deploy_on_host1(HOSTS[0])
+    copy_deploy_ssh_key_to_others(HOSTS[0], HOSTS)
+    create_admin_ssh_config_on_host1(HOSTS[0], FQDNS)
+
+if __name__ == "__main__":
+    main()
+EOF
