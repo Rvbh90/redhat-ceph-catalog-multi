@@ -1,0 +1,79 @@
+#!/bin/bash
+
+python3 - <<EOF
+import subprocess
+import json
+import time
+import re
+from pathlib import Path
+
+# Find all input_*.json files in /tmp
+files = sorted(Path("/tmp").glob("ceph-input_*.json"))
+
+if not files:
+    raise FileNotFoundError("No ceph-input_*.json files found in /tmp")
+
+# Pick the latest one
+latest_file = files[-1]
+print(f"📄 Using input file: {latest_file}")
+
+# Load JSON from latest file
+with latest_file.open() as f:
+    data = json.load(f)
+
+# Parse NODES_INPUT string
+raw_nodes = data["NODES_INPUT"]
+pattern = r"value:([\d\.]+),\s*key:([\w\.\-]+)"
+matches = re.findall(pattern, raw_nodes)
+
+if not matches:
+    print("❌ Failed to parse NODES_INPUT format.")
+    exit(1)
+
+# List of (ip, fqdn)
+nodes = [(ip.strip(), fqdn.strip()) for ip, fqdn in matches]
+
+# First node is host1
+HOST1_IP, HOST1_FQDN = nodes[0]
+
+# Other nodes
+OTHER_NODES = nodes[1:]
+
+SSH_KEY_PATH = Path("/opt/morpheus/.local/.ssh/id_rsa")
+USER = data["ceph_adminuser"]
+
+def run(cmd):
+    print(f"🚀 Running: {cmd}")
+    subprocess.run(cmd, shell=True, check=True)
+
+def add_host_key(ip):
+    cmd = (
+        f'ssh -i "{SSH_KEY_PATH}" root@{HOST1_IP} '
+        f"\"su - {USER} -c 'ssh-keyscan -H {ip} >> ~/.ssh/known_hosts'\""
+    )
+    run(cmd)
+
+def copy_ceph_pub_key():
+    # Copy /etc/ceph/ceph.pub from host1 to other hosts
+    for ip, fqdn in OTHER_NODES:
+        add_host_key(ip)
+        ssh_copy_id_cmd = (
+            f'ssh -i "{SSH_KEY_PATH}" root@{HOST1_IP} '
+            f"\"su - {USER} -c 'ssh-copy-id -f -i /etc/ceph/ceph.pub {USER}@{ip}'\""
+        )
+        run(ssh_copy_id_cmd)
+
+def add_hosts_to_ceph():
+    cmds = []
+    for ip, fqdn in OTHER_NODES:
+        cmds.append(f"ceph orch host add {fqdn}")
+    cmds.append("ceph orch apply osd --all-available-devices")
+    orch_cmd = f"ssh -i '{SSH_KEY_PATH}' root@{HOST1_IP} '{' && '.join(cmds)}'"
+    run(orch_cmd)
+    print("⏳ Sleeping for 4 minutes to allow OSD apply to finish...")
+    time.sleep(240)
+
+if __name__ == "__main__":
+    copy_ceph_pub_key()
+    add_hosts_to_ceph()
+EOF
