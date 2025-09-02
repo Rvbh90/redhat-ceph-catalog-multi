@@ -1,0 +1,59 @@
+#!/bin/bash
+
+# ====== Python execution ======
+python3 - <<EOF
+import subprocess
+import json
+import re
+from pathlib import Path
+
+# Find all input_*.json files in /tmp
+files = sorted(Path("/tmp").glob("ceph-input_*.json"))
+
+if not files:
+    raise FileNotFoundError("No ceph-input_*.json files found in /tmp")
+
+# Pick the latest one
+latest_file = files[-1]
+
+print(f"📄 Using input file: {latest_file}")
+
+# Load JSON from latest file
+with latest_file.open() as f:
+    data = json.load(f)
+
+# Parse NODES_INPUT field to extract IPs and FQDNs
+raw_nodes = data.get("NODES_INPUT", "")
+pattern = r"value:([\d\.]+),\s*key:([\w\.\-]+)"
+matches = re.findall(pattern, raw_nodes)
+
+if not matches or len(matches) < 2:
+    print("❌ Error: NODES_INPUT must contain at least two nodes.")
+    exit(1)
+
+# First node is used to run SSH commands
+HOST1_IP = matches[0][0]  # IP of first node
+FQDNS = [fqdn for _, fqdn in matches]
+MDS_TARGETS = FQDNS[1:]  # All except the first node for MDS placement
+
+SSH_KEY_PATH = Path("/opt/morpheus/.local/.ssh/id_rsa")
+POOL_NAME = data["fs_pool_name"]
+NUM_DAEMONS = data["number_of_daemons"]
+
+def run(cmd):
+    print(f"🚀 Running: {cmd}")
+    subprocess.run(cmd, shell=True, check=True)
+
+def create_ceph_fs():
+    placement_str = f"{NUM_DAEMONS} " + " ".join(MDS_TARGETS)
+    ssh_cmd = (
+        f"ssh -i '{SSH_KEY_PATH}' root@{HOST1_IP} "
+        f"'ceph fs volume create {POOL_NAME} && "
+        f"sleep 180 && "
+        f"ceph orch apply mds {POOL_NAME} --placement=\"{placement_str}\"'"
+    )
+    run(ssh_cmd)
+
+if __name__ == "__main__":
+    create_ceph_fs()
+EOF
