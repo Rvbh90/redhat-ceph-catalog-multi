@@ -1,0 +1,116 @@
+#!/bin/bash
+
+# Python block
+python3 - <<EOF
+import subprocess
+import json
+import sys
+import re
+from pathlib import Path
+
+# Find all input_*.json files in /tmp
+files = sorted(Path("/tmp").glob("ceph-input_*.json"))
+if not files:
+    raise FileNotFoundError("❌ No ceph-input_*.json files found in /tmp")
+
+latest_file = files[-1]
+print(f"📄 Using input file: {latest_file}")
+
+# Load JSON from latest file
+with latest_file.open() as f:
+    data = json.load(f)
+
+# Parse NODES_INPUT into a HOST_MAP of {IP: FQDN}
+nodes_input = data.get("NODES_INPUT", "")
+nodes = re.findall(r"value:([\d\.]+), key:([^\]]+)", nodes_input)
+if not nodes:
+    print("❌ No valid nodes found in NODES_INPUT.")
+    sys.exit(1)
+
+HOST_MAP = {ip: fqdn for ip, fqdn in nodes}
+HOST1 = list(HOST_MAP.keys())[0]  # First host becomes the primary node
+SSH_KEY_PATH = Path("/opt/morpheus/.local/.ssh/id_rsa")
+USER = data["ceph_adminuser"]
+
+def run(command, check=True):
+    print(f"💻 Running: {command}")
+    try:
+        result = subprocess.run(command, shell=True, check=check, text=True, capture_output=True)
+        if result.stdout.strip():
+            print(result.stdout.strip())
+        if result.stderr.strip():
+            print(result.stderr.strip())
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Error: {e.stderr.strip()}")
+        sys.exit(1)
+
+def install_cephadm_and_ansible():
+    print(f"\n📦 Installing cephadm and cephadm-ansible on {HOST1}...")
+    run(f'ssh -i "{SSH_KEY_PATH}" root@{HOST1} "dnf install -y cephadm-ansible cephadm"')
+    print(f"✅ cephadm & cephadm-ansible installed on {HOST1}")
+
+def configure_ansible_cfg():
+    print(f"\n📝 Configuring ansible.cfg for cephadm on {HOST1}...")
+    run(f'ssh -i "{SSH_KEY_PATH}" root@{HOST1} "mkdir -p /usr/share/cephadm-ansible/inventory"')
+    run(
+        f'ssh -i "{SSH_KEY_PATH}" root@{HOST1} '
+        f'"sed -i \'/^timeout = 60/a inventory = /usr/share/cephadm-ansible/inventory\' /usr/share/cephadm-ansible/ansible.cfg"'
+    )
+    print(f"✅ ansible.cfg updated on {HOST1}")
+
+def create_inventory():
+    print(f"\n📋 Creating Ceph inventory hosts file on {HOST1}...")
+    hosts_content = "\n".join(HOST_MAP.values())
+    admin_host = list(HOST_MAP.values())[0]
+    inventory_text = f"{hosts_content}\n[admin]\n{admin_host}\n"
+
+    heredoc_cmd = (
+        f"ssh -i '{SSH_KEY_PATH}' root@{HOST1} bash -c \"'cat > /usr/share/cephadm-ansible/inventory/hosts <<'EOT'\n"
+        f"{inventory_text}"
+        f"EOT\nchmod 644 /usr/share/cephadm-ansible/inventory/hosts'\""
+    )
+    run(heredoc_cmd)
+    print(f"✅ Inventory created on {HOST1}")
+
+def update_etc_hosts():
+    print(f"\n📡 Updating /etc/hosts on {HOST1}...")
+    hosts_entries = "\n".join([f"{ip} {fqdn}" for ip, fqdn in HOST_MAP.items()])
+    heredoc_cmd = (
+        f"ssh -i '{SSH_KEY_PATH}' root@{HOST1} bash -c \"'cat > /etc/hosts <<'EOT'\n"
+        f"{hosts_entries}"
+        f"\nEOT'\""
+    )
+    run(heredoc_cmd)
+    print(f"✅ /etc/hosts updated on {HOST1}")
+
+def create_registry_file_on_host1(host1_ip, url_registry, rhsub_username, rhsub_password):
+    print(f"\n🔐 Creating registry file on {host1_ip}...")
+    ssh_cmd = (
+        f"ssh -i '{SSH_KEY_PATH}' root@{host1_ip} bash -c 'cat > /etc/mylogin.json <<EOF\n"
+        "{\n"
+        f"  \"url\": \"{url_registry}\",\n"
+        f"  \"username\": \"{rhsub_username}\",\n"
+        f"  \"password\": \"{rhsub_password}\"\n"
+        "}\n"
+        "EOF\n"
+        "chmod 600 /etc/mylogin.json\n"
+        "'"
+    )
+    run(ssh_cmd)
+    print(f"✅ Registry file created on {host1_ip}")
+
+def main():
+    install_cephadm_and_ansible()
+    configure_ansible_cfg()
+    create_inventory()
+    update_etc_hosts()
+    create_registry_file_on_host1(
+        HOST1,
+        data["url_registry"],
+        data["rhsub_username"],
+        data["rhsub_password"]
+    )
+
+if __name__ == "__main__":
+    main()
+EOF
