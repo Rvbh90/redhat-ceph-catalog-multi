@@ -1,0 +1,54 @@
+#!/bin/bash
+
+python3 - <<EOF
+import subprocess
+import json
+import re
+from pathlib import Path
+
+# Find all input_*.json files in /tmp
+files = sorted(Path("/tmp").glob("ceph-input_*.json"))
+
+if not files:
+    raise FileNotFoundError("No ceph-input_*.json files found in /tmp")
+
+# Pick the latest one
+latest_file = files[-1]
+print(f"📄 Using input file: {latest_file}")
+
+# Load JSON from latest file
+with latest_file.open() as f:
+    data = json.load(f)
+
+# Parse NODES_INPUT
+raw_nodes = data["NODES_INPUT"]
+pattern = r"value:([\d\.]+),\s*key:([\w\.\-]+)"
+matches = re.findall(pattern, raw_nodes)
+
+if not matches:
+    print("❌ Failed to parse NODES_INPUT format.")
+    exit(1)
+
+# Use the first node as HOST1
+HOST1_IP, _ = matches[0]
+
+SSH_KEY_PATH = Path("/opt/morpheus/.local/.ssh/id_rsa")
+POOL_NAME = data["rbd_pool_name"]
+
+def run(cmd):
+    print(f"🚀 Running: {cmd}")
+    subprocess.run(cmd, shell=True, check=True)
+
+def create_pool_and_image():
+    ceph_cmds = (
+        f'ceph osd pool create {POOL_NAME} && '
+        f'ceph osd pool application enable {POOL_NAME} rbd && '
+        f'rbd pool init -p {POOL_NAME} && '
+        f'rbd create image1 --size 1024 --pool {POOL_NAME}'
+    )
+    ssh_cmd = f'ssh -i "{SSH_KEY_PATH}" root@{HOST1_IP} "{ceph_cmds}"'
+    run(ssh_cmd)
+
+if __name__ == "__main__":
+    create_pool_and_image()
+EOF
