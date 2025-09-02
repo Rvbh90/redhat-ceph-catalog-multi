@@ -1,0 +1,78 @@
+#!/bin/bash
+
+# Python block
+python3 - <<EOF
+import subprocess
+import json
+import sys
+import re
+from pathlib import Path
+
+# Find all input_*.json files in /tmp
+files = sorted(Path("/tmp").glob("ceph-input_*.json"))
+if not files:
+    raise FileNotFoundError("❌ No ceph-input_*.json files found in /tmp")
+
+# Pick the latest one
+latest_file = files[-1]
+print(f"📄 Using input file: {latest_file}")
+
+# Load JSON
+with latest_file.open() as f:
+    data = json.load(f)
+
+# Parse NODES_INPUT
+nodes_input = data.get("NODES_INPUT", "")
+nodes = re.findall(r"value:([\d\.]+), key:([^\]]+)", nodes_input)
+if not nodes:
+    print("❌ No valid nodes found in NODES_INPUT.")
+    sys.exit(1)
+
+HOSTS = [ip for ip, fqdn in nodes]
+HOST1 = HOSTS[0]
+SSH_KEY_PATH = Path("/opt/morpheus/.local/.ssh/id_rsa")
+USER = data["ceph_adminuser"]
+
+def run(command, check=True):
+    print(f"💻 Running: {command}")
+    try:
+        result = subprocess.run(command, shell=True, check=check, text=True, capture_output=True)
+        if result.stdout.strip():
+            print(result.stdout.strip())
+        if result.stderr.strip():
+            print(result.stderr.strip())
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Error: {e.stderr.strip()}")
+        sys.exit(1)
+
+def run_preflight_on_host1(host1, ssh_key_path, user):
+    print(f"\n🚀 Running preflight playbook on {host1}...")
+    ssh_command = (
+        f'ssh -i "{ssh_key_path}" root@{host1} '
+        f'"cd /usr/share/cephadm-ansible && '
+        f'sudo -u {user} ansible-playbook -i inventory/hosts '
+        f'/usr/share/cephadm-ansible/cephadm-preflight.yml --extra-vars ceph-origin=rhcs"'
+    )
+    try:
+        subprocess.run(ssh_command, shell=True, check=True)
+        print(f"✅ Preflight playbook executed successfully on {host1}")
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Failed to run preflight playbook on {host1}: {e}")
+
+def install_chrony_and_ceph_common_on_all(hosts, ssh_key_path):
+    print("\n📦 Installing chrony and ceph-common on all nodes...")
+    for ip in hosts:
+        cmd = (
+            f'ssh -i "{ssh_key_path}" root@{ip} '
+            f'"dnf install -y chrony-4.5-3.el9.x86_64 ceph-common-19.2.0-55.el9cp.x86_64"'
+        )
+        run(cmd)
+    print("✅ chrony and ceph-common installed on all nodes.")
+
+def main():
+    install_chrony_and_ceph_common_on_all(HOSTS, SSH_KEY_PATH)
+    run_preflight_on_host1(HOST1, SSH_KEY_PATH, USER)
+
+if __name__ == "__main__":
+    main()
+EOF
